@@ -1,0 +1,259 @@
+"""
+AI-Powered Meeting Minutes Generator - Streamlit version
+Built to fit inside Streamlit Community Cloud's free tier (~1GB RAM).
+
+Key differences from the Gradio/HF-Spaces version:
+- Uses Whisper "tiny" (much smaller than "base") for transcription.
+- Uses a small distilled summarizer (sshleifer/distilbart-cnn-6-6) instead
+  of full BART.
+- Models are loaded ONE AT A TIME and explicitly deleted + garbage
+  collected right after use, so peak memory never has more than one
+  model resident at once. This trades speed for memory headroom.
+- Real speaker diarization (pyannote) is OPTIONAL and opt-in via a
+  checkbox, since it's the heaviest component. By default, a simple
+  pause-based heuristic is used instead (see simple_speaker_split).
+  This is NOT true diarization - it just alternates a label whenever
+  there's a long pause between segments. It cannot recognize that a
+  speaker who left and returned is the same person.
+
+Deploy on https://share.streamlit.io for free:
+  1. Push this file (as streamlit_app.py), requirements.txt and
+     packages.txt to a public GitHub repo.
+  2. Go to share.streamlit.io -> New app -> pick the repo/branch.
+  3. Set "Main file path" to streamlit_app.py -> Deploy.
+"""
+
+import os
+import re
+import gc
+import tempfile
+from datetime import datetime
+from collections import defaultdict
+
+import streamlit as st
+from docx import Document
+
+st.set_page_config(page_title="AI Meeting Minutes Generator", page_icon="🎙️")
+
+ACTION_PATTERNS = [
+    r"\bwill\b", r"\bneeds? to\b", r"\bshould\b", r"\bgoing to\b",
+    r"\bmust\b", r"\bplease\b", r"\baction item\b",
+    r"\bby (monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{1,2}\s?(am|pm)?)\b",
+]
+ACTION_REGEX = re.compile("|".join(ACTION_PATTERNS), re.IGNORECASE)
+
+
+# --------------------------------------------------------------------
+# Pipeline stages - each one imports its own heavy library lazily and
+# frees the model from memory as soon as it's done.
+# --------------------------------------------------------------------
+
+def transcribe_audio(audio_path):
+    import whisper
+    model = whisper.load_model("tiny")
+    result = model.transcribe(audio_path, verbose=False)
+    del model
+    gc.collect()
+    return result["segments"], result["text"]
+
+
+def simple_speaker_split(segments, pause_threshold=1.2):
+    """Lightweight, no-model speaker-turn heuristic (see module docstring)."""
+    labeled = []
+    current_speaker = 1
+    prev_end = None
+    for seg in segments:
+        if prev_end is not None and (seg["start"] - prev_end) > pause_threshold:
+            current_speaker = 2 if current_speaker == 1 else 1
+        labeled.append({
+            "speaker": f"Speaker {current_speaker}",
+            "text": seg["text"].strip(),
+            "start": seg["start"],
+            "end": seg["end"],
+        })
+        prev_end = seg["end"]
+    return labeled
+
+
+def real_diarization(audio_path, hf_token):
+    """True diarization via pyannote. Heavier - only run if user opts in."""
+    from pyannote.audio import Pipeline
+    pipeline = Pipeline.from_pretrained(
+        "pyannote/speaker-diarization-3.1", use_auth_token=hf_token
+    )
+    diarization = pipeline(audio_path)
+    speaker_segments = [
+        {"start": t.start, "end": t.end, "speaker": s}
+        for t, _, s in diarization.itertracks(yield_label=True)
+    ]
+    del pipeline
+    gc.collect()
+    return speaker_segments
+
+
+def attach_real_speakers(segments, speaker_segments):
+    def speaker_at(t):
+        for s in speaker_segments:
+            if s["start"] <= t <= s["end"]:
+                return s["speaker"]
+        return "Unknown"
+
+    return [
+        {
+            "speaker": speaker_at((seg["start"] + seg["end"]) / 2),
+            "text": seg["text"].strip(),
+            "start": seg["start"],
+            "end": seg["end"],
+        }
+        for seg in segments
+    ]
+
+
+def summarize_text(full_text):
+    from transformers import pipeline as hf_pipeline
+    summarizer = hf_pipeline("summarization", model="sshleifer/distilbart-cnn-6-6")
+
+    def chunk_text(text, max_words=500):
+        words = text.split()
+        for i in range(0, len(words), max_words):
+            yield " ".join(words[i:i + max_words])
+
+    parts = []
+    for chunk in chunk_text(full_text):
+        out = summarizer(chunk, max_length=100, min_length=20, do_sample=False)
+        parts.append(out[0]["summary_text"])
+
+    del summarizer
+    gc.collect()
+    return " ".join(parts)
+
+
+def extract_action_items(labeled_segments):
+    import spacy
+    nlp = spacy.load("en_core_web_sm")
+
+    items = []
+    for seg in labeled_segments:
+        text = seg["text"]
+        if ACTION_REGEX.search(text):
+            doc = nlp(text)
+            dates = [e.text for e in doc.ents if e.label_ == "DATE"]
+            people = [e.text for e in doc.ents if e.label_ == "PERSON"]
+            owner = people[0] if people else seg["speaker"]
+            due = dates[0] if dates else "Not specified"
+            items.append({"task": text, "owner": owner, "due": due})
+
+    del nlp
+    gc.collect()
+    return items
+
+
+def build_docx(summary, action_items, labeled_segments):
+    speaking_time = defaultdict(float)
+    for seg in labeled_segments:
+        speaking_time[seg["speaker"]] += seg["end"] - seg["start"]
+
+    doc = Document()
+    doc.add_heading("Meeting Minutes (Auto-Generated)", level=1)
+    doc.add_paragraph(f"Date: {datetime.now().strftime('%d %b %Y')}")
+
+    doc.add_heading("Participants", level=2)
+    for speaker, secs in speaking_time.items():
+        doc.add_paragraph(f"{speaker} - spoke {int(secs // 60)}m {int(secs % 60)}s", style="List Bullet")
+
+    doc.add_heading("Summary", level=2)
+    doc.add_paragraph(summary)
+
+    doc.add_heading("Action Items", level=2)
+    table = doc.add_table(rows=1, cols=3)
+    table.style = "Light Grid Accent 1"
+    hdr = table.rows[0].cells
+    hdr[0].text, hdr[1].text, hdr[2].text = "Task", "Owner", "Due"
+    for a in action_items:
+        row = table.add_row().cells
+        row[0].text, row[1].text, row[2].text = a["task"], a["owner"], a["due"]
+
+    tmp_path = os.path.join(tempfile.gettempdir(), "Meeting_Minutes.docx")
+    doc.save(tmp_path)
+    return tmp_path
+
+
+# --------------------------------------------------------------------
+# UI
+# --------------------------------------------------------------------
+st.title("🎙️ AI-Powered Meeting Minutes Generator")
+st.caption(
+    "Lightweight build for free hosting (~1GB RAM): Whisper-tiny + a small "
+    "distilled summarizer + rule-based action-item extraction. Models load "
+    "one at a time and are released from memory immediately after use."
+)
+
+uploaded_file = st.file_uploader("Upload meeting audio (.wav / .mp3 / .m4a)", type=["wav", "mp3", "m4a"])
+
+use_real_diarization = st.checkbox(
+    "Attempt real speaker diarization (pyannote) - heavier, may fail on free hosting",
+    value=False,
+)
+hf_token = None
+if use_real_diarization:
+    hf_token = st.text_input(
+        "Hugging Face token (read access; needed for pyannote)", type="password"
+    )
+    st.caption(
+        "Accept the model terms first at huggingface.co/pyannote/speaker-diarization-3.1 "
+        "and huggingface.co/pyannote/segmentation-3.0, then generate a token at "
+        "huggingface.co/settings/tokens."
+    )
+
+if uploaded_file and st.button("Generate Minutes", type="primary"):
+    suffix = os.path.splitext(uploaded_file.name)[1]
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(uploaded_file.read())
+        audio_path = tmp.name
+
+    try:
+        with st.spinner("Transcribing audio (Whisper-tiny)..."):
+            segments, full_text = transcribe_audio(audio_path)
+
+        with st.spinner("Identifying speakers..."):
+            if use_real_diarization and hf_token:
+                try:
+                    speaker_segments = real_diarization(audio_path, hf_token)
+                    labeled_segments = attach_real_speakers(segments, speaker_segments)
+                except Exception as e:
+                    st.warning(f"Real diarization failed ({e}); falling back to simple speaker-turn detection.")
+                    labeled_segments = simple_speaker_split(segments)
+            else:
+                labeled_segments = simple_speaker_split(segments)
+
+        with st.spinner("Summarizing discussion..."):
+            summary = summarize_text(full_text)
+
+        with st.spinner("Extracting action items..."):
+            action_items = extract_action_items(labeled_segments)
+
+        with st.spinner("Building minutes document..."):
+            docx_path = build_docx(summary, action_items, labeled_segments)
+    finally:
+        if os.path.exists(audio_path):
+            os.remove(audio_path)
+        gc.collect()
+
+    st.subheader("Transcript (with speaker turns)")
+    st.text("\n".join(f"[{s['speaker']}] {s['text']}" for s in labeled_segments))
+
+    st.subheader("AI-Generated Summary")
+    st.write(summary)
+
+    st.subheader("Action Items")
+    if action_items:
+        st.table(action_items)
+    else:
+        st.write("No clear action items detected.")
+
+    with open(docx_path, "rb") as f:
+        st.download_button(
+            "📄 Download Meeting Minutes (.docx)",
+            f,
+            file_name="Meeting_Minutes.docx",
+        )
