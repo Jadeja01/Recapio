@@ -86,7 +86,10 @@ def real_diarization(audio_path, hf_token):
     # AttributeError on those newer torchaudio builds. Shim it back in
     # as a harmless no-op so pyannote's internal check doesn't crash.
     if not hasattr(torchaudio, "list_audio_backends"):
-        torchaudio.list_audio_backends = lambda: []
+        # Must be non-empty: pyannote/torchaudio-adjacent code indexes
+        # into this list (e.g. backends[0]) to pick a default backend.
+        # "soundfile" is the modern default backend name.
+        torchaudio.list_audio_backends = lambda: ["soundfile"]
 
     from pyannote.audio import Pipeline
     pipeline = Pipeline.from_pretrained(
@@ -292,7 +295,12 @@ if uploaded_file and st.button("Generate Minutes", type="primary"):
                     speaker_segments = real_diarization(audio_path, hf_token)
                     labeled_segments = attach_real_speakers(segments, speaker_segments)
                 except Exception as e:
-                    st.warning(f"Real diarization failed ({e}); falling back to simple speaker-turn detection.")
+                    import traceback
+                    st.warning(
+                        f"Real diarization failed ({e}); falling back to simple speaker-turn detection."
+                    )
+                    with st.expander("Show full error details"):
+                        st.code(traceback.format_exc())
                     labeled_segments = simple_speaker_split(segments)
             else:
                 labeled_segments = simple_speaker_split(segments, pause_threshold=pause_threshold)
