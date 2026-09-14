@@ -1,10 +1,14 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
 streamlit
-torch
+torch==2.1.2+cpu
+torchaudio==2.1.2+cpu
 openai-whisper
 transformers
 sentencepiece
 python-docx
 spacy
-pyannote.audio
+# pyannote 3.x uses torchaudio's backend API. Keep it paired with a
+# torchaudio release that still provides that API; unpinned latest versions
+# otherwise fail at runtime with errors such as "list index out of range".
+pyannote.audio==3.3.2
 https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
