@@ -79,6 +79,15 @@ def simple_speaker_split(segments, pause_threshold=1.2):
 
 def real_diarization(audio_path, hf_token):
     """True diarization via pyannote. Heavier - only run if user opts in."""
+    import torchaudio
+    # Newer torchaudio releases removed the old multi-backend dispatch
+    # API (list_audio_backends / set_audio_backend). Some pyannote.audio
+    # versions still call list_audio_backends() internally, which raises
+    # AttributeError on those newer torchaudio builds. Shim it back in
+    # as a harmless no-op so pyannote's internal check doesn't crash.
+    if not hasattr(torchaudio, "list_audio_backends"):
+        torchaudio.list_audio_backends = lambda: []
+
     from pyannote.audio import Pipeline
     pipeline = Pipeline.from_pretrained(
         "pyannote/speaker-diarization-3.1", use_auth_token=hf_token
