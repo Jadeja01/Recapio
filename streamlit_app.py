@@ -58,7 +58,9 @@ def transcribe_audio(audio_path):
 
 
 def simple_speaker_split(segments, pause_threshold=1.2):
-    """Lightweight, no-model speaker-turn heuristic (see module docstring)."""
+    """Lightweight, no-model speaker-turn heuristic (see module docstring).
+    pause_threshold: seconds of silence between segments before flipping
+    the speaker label. Lower = more sensitive to short pauses."""
     labeled = []
     current_speaker = 1
     prev_end = None
@@ -150,27 +152,44 @@ def summarize_text(full_text):
     return " ".join(parts)
 
 
-def extract_action_items(labeled_segments):
+def extract_action_items_and_dates(labeled_segments):
+    """Single spaCy pass that returns two things:
+    - action_items: lines matching ACTION_REGEX, with owner + due date
+    - key_dates: every DATE entity mentioned anywhere in the transcript,
+      with the speaker who said it and the sentence it appeared in
+      (used for the Agenda / Key Dates section)."""
     import spacy
     nlp = spacy.load("en_core_web_sm")
 
-    items = []
+    action_items = []
+    key_dates = []
+
     for seg in labeled_segments:
         text = seg["text"]
+        if not text:
+            continue
+        doc = nlp(text)
+        dates_in_seg = [e.text for e in doc.ents if e.label_ == "DATE"]
+
         if ACTION_REGEX.search(text):
-            doc = nlp(text)
-            dates = [e.text for e in doc.ents if e.label_ == "DATE"]
             people = [e.text for e in doc.ents if e.label_ == "PERSON"]
             owner = people[0] if people else seg["speaker"]
-            due = dates[0] if dates else "Not specified"
-            items.append({"task": text, "owner": owner, "due": due})
+            due = dates_in_seg[0] if dates_in_seg else "Not specified"
+            action_items.append({"task": text, "owner": owner, "due": due})
+
+        for d in dates_in_seg:
+            key_dates.append({
+                "date": d,
+                "speaker": seg["speaker"],
+                "context": text,
+            })
 
     del nlp
     gc.collect()
-    return items
+    return action_items, key_dates
 
 
-def build_docx(summary, action_items, labeled_segments):
+def build_docx(summary, action_items, key_dates, labeled_segments):
     speaking_time = defaultdict(float)
     for seg in labeled_segments:
         speaking_time[seg["speaker"]] += seg["end"] - seg["start"]
@@ -185,6 +204,16 @@ def build_docx(summary, action_items, labeled_segments):
 
     doc.add_heading("Summary", level=2)
     doc.add_paragraph(summary)
+
+    if key_dates:
+        doc.add_heading("Key Dates Mentioned (Agenda)", level=2)
+        table = doc.add_table(rows=1, cols=3)
+        table.style = "Light Grid Accent 1"
+        hdr = table.rows[0].cells
+        hdr[0].text, hdr[1].text, hdr[2].text = "Date", "Speaker", "Context"
+        for d in key_dates:
+            row = table.add_row().cells
+            row[0].text, row[1].text, row[2].text = d["date"], d["speaker"], d["context"]
 
     doc.add_heading("Action Items", level=2)
     table = doc.add_table(rows=1, cols=3)
@@ -226,6 +255,17 @@ if use_real_diarization:
         "and huggingface.co/pyannote/segmentation-3.0, then generate a token at "
         "huggingface.co/settings/tokens."
     )
+else:
+    pause_threshold = st.slider(
+        "Speaker-turn pause sensitivity (seconds)",
+        min_value=0.3, max_value=3.0, value=1.2, step=0.1,
+        help=(
+            "Simple speaker-turn detection flips the speaker label whenever "
+            "the gap between segments exceeds this value. Lower it if your "
+            "audio has short pauses between speakers; raise it if one "
+            "speaker's natural pauses are wrongly splitting them into two."
+        ),
+    )
 
 if uploaded_file and st.button("Generate Minutes", type="primary"):
     suffix = os.path.splitext(uploaded_file.name)[1]
@@ -246,16 +286,16 @@ if uploaded_file and st.button("Generate Minutes", type="primary"):
                     st.warning(f"Real diarization failed ({e}); falling back to simple speaker-turn detection.")
                     labeled_segments = simple_speaker_split(segments)
             else:
-                labeled_segments = simple_speaker_split(segments)
+                labeled_segments = simple_speaker_split(segments, pause_threshold=pause_threshold)
 
         with st.spinner("Summarizing discussion..."):
             summary = summarize_text(full_text)
 
-        with st.spinner("Extracting action items..."):
-            action_items = extract_action_items(labeled_segments)
+        with st.spinner("Extracting action items and key dates..."):
+            action_items, key_dates = extract_action_items_and_dates(labeled_segments)
 
         with st.spinner("Building minutes document..."):
-            docx_path = build_docx(summary, action_items, labeled_segments)
+            docx_path = build_docx(summary, action_items, key_dates, labeled_segments)
     finally:
         if os.path.exists(audio_path):
             os.remove(audio_path)
@@ -266,6 +306,12 @@ if uploaded_file and st.button("Generate Minutes", type="primary"):
 
     st.subheader("AI-Generated Summary")
     st.write(summary)
+
+    st.subheader("Key Dates Mentioned (Agenda)")
+    if key_dates:
+        st.table(key_dates)
+    else:
+        st.write("No specific dates detected in the discussion.")
 
     st.subheader("Action Items")
     if action_items:
