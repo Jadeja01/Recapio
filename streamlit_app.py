@@ -33,7 +33,11 @@ from collections import defaultdict
 import streamlit as st
 from docx import Document
 
-st.set_page_config(page_title="AI Meeting Minutes Generator", page_icon="🎙️")
+st.set_page_config(
+    page_title="Recepio | Meeting minutes, ready to share",
+    page_icon="🎙️",
+    layout="wide",
+)
 
 ACTION_PATTERNS = [
     r"\bwill\b", r"\bneeds? to\b", r"\bshould\b", r"\bgoing to\b",
@@ -264,19 +268,62 @@ def build_docx(summary, action_items, key_dates, labeled_segments):
 # --------------------------------------------------------------------
 # UI
 # --------------------------------------------------------------------
-st.title("🎙️ AI-Powered Meeting Minutes Generator")
-st.caption(
-    "Lightweight build for free hosting (~1GB RAM): Whisper-tiny + a small "
-    "distilled summarizer + rule-based action-item extraction. Models load "
-    "one at a time and are released from memory immediately after use."
+st.markdown(
+    """
+    <style>
+        .stApp { background: #f7f8fc; }
+        .block-container { max-width: 1120px; padding-top: 2.5rem; padding-bottom: 3rem; }
+        .hero {
+            background: linear-gradient(120deg, #15235d 0%, #3d2d83 58%, #7450ac 100%);
+            border-radius: 22px;
+            color: white;
+            padding: 2.5rem 2.75rem;
+            margin-bottom: 1.6rem;
+            box-shadow: 0 18px 40px rgba(37, 30, 91, 0.18);
+        }
+        .eyebrow { color: #d9ccff; font-size: 0.82rem; font-weight: 700; letter-spacing: 0.09em; text-transform: uppercase; margin-bottom: 0.65rem; }
+        .hero h1 { color: white; font-size: 2.45rem; line-height: 1.12; margin: 0 0 0.7rem; }
+        .hero p { color: #eeeaff; font-size: 1.05rem; line-height: 1.6; margin: 0; max-width: 650px; }
+        .section-kicker { color: #6b7280; font-size: 0.82rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; margin: 0.5rem 0 0.3rem; }
+        .section-title { color: #18213d; font-size: 1.45rem; font-weight: 700; margin: 0 0 0.25rem; }
+        .section-copy { color: #5b6477; margin: 0 0 1rem; }
+        .step { background: white; border: 1px solid #e6e9f1; border-radius: 14px; padding: 1rem 1.1rem; min-height: 122px; }
+        .step-number { color: #6645a5; font-weight: 800; font-size: 0.8rem; letter-spacing: 0.06em; }
+        .step-title { color: #202944; font-weight: 700; margin: 0.25rem 0; }
+        .step-copy { color: #667085; font-size: 0.9rem; line-height: 1.45; margin: 0; }
+        .stFileUploader { background: white; border: 1px solid #e1e5ee; border-radius: 14px; padding: 0.85rem 1rem; }
+        div[data-testid="stExpander"] { background: white; border: 1px solid #e6e9f1; border-radius: 12px; }
+        .stButton > button { border-radius: 9px; font-weight: 700; min-height: 2.7rem; }
+    </style>
+    <section class="hero">
+        <div class="eyebrow">Recepio · Meeting intelligence</div>
+        <h1>Turn conversations into<br>clear next steps.</h1>
+        <p>Upload your meeting recording and get a share-ready summary, action items, key dates, and a downloadable minutes document.</p>
+    </section>
+    """,
+    unsafe_allow_html=True,
 )
 
-uploaded_file = st.file_uploader("Upload meeting audio (.wav / .mp3 / .m4a)", type=["wav", "mp3", "m4a"])
+st.markdown('<div class="section-kicker">Create minutes</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-title">Start with your recording</div>', unsafe_allow_html=True)
+st.markdown('<p class="section-copy">MP3, WAV, and M4A files are supported. Processing happens one stage at a time to keep the app lightweight.</p>', unsafe_allow_html=True)
 
-use_real_diarization = st.checkbox(
-    "Attempt real speaker diarization (pyannote) - heavier, may fail on free hosting",
-    value=False,
+uploaded_file = st.file_uploader(
+    "Meeting recording",
+    type=["wav", "mp3", "m4a"],
+    help="Choose an audio recording of the meeting you want to turn into minutes.",
 )
+
+with st.expander("Speaker detection settings", expanded=False):
+    st.caption("Use the default setting for the fastest, most reliable experience on free hosting.")
+    use_real_diarization = st.checkbox(
+        "Use advanced speaker recognition (requires a Hugging Face token and more memory)",
+        value=False,
+    )
+
+if not use_real_diarization:
+    st.caption("Using simple speaker-turn detection. You can fine-tune it below if needed.")
+
 hf_token = None
 pause_threshold = 1.2
 if use_real_diarization:
@@ -299,6 +346,25 @@ else:
             "speaker's natural pauses are wrongly splitting them into two."
         ),
     )
+
+st.markdown('<div class="section-kicker">How it works</div>', unsafe_allow_html=True)
+steps = st.columns(3)
+for column, number, title, copy in zip(
+    steps,
+    ("01", "02", "03"),
+    ("Upload", "Review", "Share"),
+    (
+        "Add your meeting recording in one of the supported formats.",
+        "Recepio transcribes, summarizes, and highlights commitments.",
+        "Review the results and download polished meeting minutes.",
+    ),
+):
+    column.markdown(
+        f'<div class="step"><div class="step-number">{number}</div><div class="step-title">{title}</div><p class="step-copy">{copy}</p></div>',
+        unsafe_allow_html=True,
+    )
+
+st.markdown("<br>", unsafe_allow_html=True)
 
 if uploaded_file and st.button("Generate Minutes", type="primary"):
     suffix = os.path.splitext(uploaded_file.name)[1]
