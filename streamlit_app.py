@@ -9,10 +9,8 @@ Key differences from the Gradio/HF-Spaces version:
 - Models are loaded ONE AT A TIME and explicitly deleted + garbage
   collected right after use, so peak memory never has more than one
   model resident at once. This trades speed for memory headroom.
-- Real speaker diarization (pyannote) is OPTIONAL and opt-in via a
-  checkbox, since it's the heaviest component. By default, a simple
-  pause-based heuristic is used instead (see simple_speaker_split).
-  This is NOT true diarization - it just alternates a label whenever
+- Speaker turns use a simple pause-based heuristic (see
+  simple_speaker_split). This is NOT true diarization - it alternates a label whenever
   there's a long pause between segments. It cannot recognize that a
   speaker who left and returned is the same person.
 
@@ -79,72 +77,6 @@ def simple_speaker_split(segments, pause_threshold=1.2):
         })
         prev_end = seg["end"]
     return labeled
-
-
-def has_memory_for_real_diarization(minimum_gib=2):
-    """Avoid a process-level OOM kill on memory-limited Linux hosts.
-
-    Pyannote's neural diarization model does not fit alongside a running
-    Streamlit process in the 1 GB Community Cloud container.  An OOM kill
-    cannot be caught in Python, so check the cgroup limit before loading it.
-    Unknown limits are treated as sufficient, which keeps local deployments
-    and larger hosts fully functional.
-    """
-    cgroup_limit = "/sys/fs/cgroup/memory.max"
-    try:
-        with open(cgroup_limit, "r", encoding="utf-8") as limit_file:
-            value = limit_file.read().strip()
-        if value == "max":
-            return True
-        return int(value) >= minimum_gib * 1024 ** 3
-    except (OSError, ValueError):
-        return True
-
-
-def real_diarization(audio_path, hf_token):
-    """True diarization using pyannote's current TorchCodec-compatible model."""
-    from pyannote.audio import Pipeline
-
-    # ``community-1`` is the maintained pyannote pipeline for pyannote.audio
-    # 4.x. The legacy ``speaker-diarization-3.1`` pipeline is only compatible
-    # with pyannote.audio 3.x and breaks with current Streamlit Cloud wheels.
-    pipeline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-community-1", token=hf_token
-    )
-    output = pipeline(audio_path)
-
-    # The exclusive annotation prevents overlapping labels and maps more
-    # cleanly to Whisper's timestamped transcript segments.
-    diarization = output.exclusive_speaker_diarization
-    speaker_segments = [
-        {"start": turn.start, "end": turn.end, "speaker": speaker}
-        for turn, speaker in diarization
-    ]
-    if not speaker_segments:
-        raise RuntimeError(
-            "Pyannote did not find any speech. Check that the uploaded audio contains audible speech."
-        )
-    del pipeline
-    gc.collect()
-    return speaker_segments
-
-
-def attach_real_speakers(segments, speaker_segments):
-    def speaker_at(t):
-        for s in speaker_segments:
-            if s["start"] <= t <= s["end"]:
-                return s["speaker"]
-        return "Unknown"
-
-    return [
-        {
-            "speaker": speaker_at((seg["start"] + seg["end"]) / 2),
-            "text": seg["text"].strip(),
-            "start": seg["start"],
-            "end": seg["end"],
-        }
-        for seg in segments
-    ]
 
 
 def summarize_text(full_text):
@@ -265,11 +197,6 @@ def build_docx(summary, action_items, key_dates, labeled_segments):
     return tmp_path
 
 
-def save_hf_token():
-    """Keep the token when the advanced option is temporarily turned off."""
-    st.session_state["saved_hf_token"] = st.session_state.get("hf_token_input", "")
-
-
 # --------------------------------------------------------------------
 # UI
 # --------------------------------------------------------------------
@@ -324,44 +251,18 @@ uploaded_file = st.file_uploader(
     help="Choose an audio recording of the meeting you want to turn into minutes.",
 )
 
-with st.expander("Speaker detection settings", expanded=False):
-    st.caption("Use the default setting for the fastest, most reliable experience on free hosting.")
-    use_real_diarization = st.checkbox(
-        "Use advanced speaker recognition (requires a Hugging Face token and more memory)",
-        value=False,
-    )
-
-if not use_real_diarization:
-    st.caption("Using simple speaker-turn detection. You can fine-tune it below if needed.")
-
-hf_token = None
-pause_threshold = 1.2
-if use_real_diarization:
-    hf_token = st.text_input(
-        "Hugging Face token (read access; needed for pyannote)",
-        value=st.session_state.get("saved_hf_token", ""),
-        type="password",
-        key="hf_token_input",
-        on_change=save_hf_token,
-    )
-    # Save it on every rerun too, so a subsequent checkbox toggle keeps it.
-    st.session_state["saved_hf_token"] = hf_token
-    st.caption(
-        "Accept the model terms first at huggingface.co/pyannote/speaker-diarization-community-1, "
-        "then generate a token at "
-        "huggingface.co/settings/tokens."
-    )
-else:
-    pause_threshold = st.slider(
-        "Speaker-turn pause sensitivity (seconds)",
-        min_value=0.3, max_value=3.0, value=1.2, step=0.1,
-        help=(
-            "Simple speaker-turn detection flips the speaker label whenever "
-            "the gap between segments exceeds this value. Lower it if your "
-            "audio has short pauses between speakers; raise it if one "
-            "speaker's natural pauses are wrongly splitting them into two."
-        ),
-    )
+st.caption("Speaker labels are based on pauses in the conversation. Adjust the sensitivity if needed.")
+pause_threshold = st.slider(
+    "Speaker-turn pause sensitivity (seconds)",
+    min_value=0.3,
+    max_value=3.0,
+    value=1.2,
+    step=0.1,
+    help=(
+        "A speaker label switches when the gap between transcript segments exceeds this value. "
+        "Lower it for short pauses between speakers; raise it when one speaker is split too often."
+    ),
+)
 
 st.markdown('<div class="section-kicker">How it works</div>', unsafe_allow_html=True)
 steps = st.columns(3)
@@ -393,27 +294,7 @@ if uploaded_file and st.button("Generate Minutes", type="primary"):
             segments, full_text = transcribe_audio(audio_path)
 
         with st.spinner("Identifying speakers..."):
-            if use_real_diarization and hf_token:
-                if not has_memory_for_real_diarization():
-                    st.warning(
-                        "Real pyannote diarization needs at least 2 GB of RAM and is disabled "
-                        "on this host to prevent the app from crashing. Using simple speaker-turn detection."
-                    )
-                    labeled_segments = simple_speaker_split(segments, pause_threshold=pause_threshold)
-                else:
-                    try:
-                        speaker_segments = real_diarization(audio_path, hf_token.strip())
-                        labeled_segments = attach_real_speakers(segments, speaker_segments)
-                    except Exception as e:
-                        import traceback
-                        st.warning(
-                            f"Real diarization failed ({e}); falling back to simple speaker-turn detection."
-                        )
-                        with st.expander("Show full error details"):
-                            st.code(traceback.format_exc())
-                        labeled_segments = simple_speaker_split(segments, pause_threshold=pause_threshold)
-            else:
-                labeled_segments = simple_speaker_split(segments, pause_threshold=pause_threshold)
+            labeled_segments = simple_speaker_split(segments, pause_threshold=pause_threshold)
 
         with st.spinner("Summarizing discussion..."):
             summary = summarize_text(full_text)
