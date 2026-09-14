@@ -1,14 +1,15 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
 streamlit
-torch==2.1.2+cpu
-torchaudio==2.1.2+cpu
+# Streamlit Community Cloud currently uses Python 3.14. These are the CPU
+# wheels available for that runtime.
+torch==2.14.0+cpu
+torchaudio==2.11.0+cpu
+torchcodec
 openai-whisper
 transformers
 sentencepiece
 python-docx
 spacy
-# pyannote 3.x uses torchaudio's backend API. Keep it paired with a
-# torchaudio release that still provides that API; unpinned latest versions
-# otherwise fail at runtime with errors such as "list index out of range".
-pyannote.audio==3.3.2
+# The 4.x release supports current TorchCodec/torchaudio releases.
+pyannote.audio>=4.0,<5
 https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl

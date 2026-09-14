@@ -78,15 +78,23 @@ def simple_speaker_split(segments, pause_threshold=1.2):
 
 
 def real_diarization(audio_path, hf_token):
-    """True diarization via pyannote. Heavier - only run if user opts in."""
+    """True diarization using pyannote's current TorchCodec-compatible model."""
     from pyannote.audio import Pipeline
+
+    # ``community-1`` is the maintained pyannote pipeline for pyannote.audio
+    # 4.x. The legacy ``speaker-diarization-3.1`` pipeline is only compatible
+    # with pyannote.audio 3.x and breaks with current Streamlit Cloud wheels.
     pipeline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-3.1", use_auth_token=hf_token
+        "pyannote/speaker-diarization-community-1", token=hf_token
     )
-    diarization = pipeline(audio_path)
+    output = pipeline(audio_path)
+
+    # The exclusive annotation prevents overlapping labels and maps more
+    # cleanly to Whisper's timestamped transcript segments.
+    diarization = output.exclusive_speaker_diarization
     speaker_segments = [
-        {"start": t.start, "end": t.end, "speaker": s}
-        for t, _, s in diarization.itertracks(yield_label=True)
+        {"start": turn.start, "end": turn.end, "speaker": speaker}
+        for turn, speaker in diarization
     ]
     if not speaker_segments:
         raise RuntimeError(
@@ -256,8 +264,8 @@ if use_real_diarization:
         "Hugging Face token (read access; needed for pyannote)", type="password"
     )
     st.caption(
-        "Accept the model terms first at huggingface.co/pyannote/speaker-diarization-3.1 "
-        "and huggingface.co/pyannote/segmentation-3.0, then generate a token at "
+        "Accept the model terms first at huggingface.co/pyannote/speaker-diarization-community-1, "
+        "then generate a token at "
         "huggingface.co/settings/tokens."
     )
 else:
