@@ -258,6 +258,7 @@ use_real_diarization = st.checkbox(
     value=False,
 )
 hf_token = None
+pause_threshold = 1.2
 if use_real_diarization:
     hf_token = st.text_input(
         "Hugging Face token (read access; needed for pyannote)", type="password"
@@ -301,7 +302,7 @@ if uploaded_file and st.button("Generate Minutes", type="primary"):
                     )
                     with st.expander("Show full error details"):
                         st.code(traceback.format_exc())
-                    labeled_segments = simple_speaker_split(segments)
+                    labeled_segments = simple_speaker_split(segments, pause_threshold=pause_threshold)
             else:
                 labeled_segments = simple_speaker_split(segments, pause_threshold=pause_threshold)
 
