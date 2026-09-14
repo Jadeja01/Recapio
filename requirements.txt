@@ -6,7 +6,9 @@ torch==2.14.0+cpu
 torchaudio==2.11.0+cpu
 torchcodec
 openai-whisper
-transformers
+# Transformers 5 causes Streamlit's module watcher to repeatedly import
+# optional image modules that are not needed by this text-only application.
+transformers>=4.57,<5
 sentencepiece
 python-docx
 spacy

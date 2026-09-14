@@ -77,6 +77,26 @@ def simple_speaker_split(segments, pause_threshold=1.2):
     return labeled
 
 
+def has_memory_for_real_diarization(minimum_gib=2):
+    """Avoid a process-level OOM kill on memory-limited Linux hosts.
+
+    Pyannote's neural diarization model does not fit alongside a running
+    Streamlit process in the 1 GB Community Cloud container.  An OOM kill
+    cannot be caught in Python, so check the cgroup limit before loading it.
+    Unknown limits are treated as sufficient, which keeps local deployments
+    and larger hosts fully functional.
+    """
+    cgroup_limit = "/sys/fs/cgroup/memory.max"
+    try:
+        with open(cgroup_limit, "r", encoding="utf-8") as limit_file:
+            value = limit_file.read().strip()
+        if value == "max":
+            return True
+        return int(value) >= minimum_gib * 1024 ** 3
+    except (OSError, ValueError):
+        return True
+
+
 def real_diarization(audio_path, hf_token):
     """True diarization using pyannote's current TorchCodec-compatible model."""
     from pyannote.audio import Pipeline
@@ -292,17 +312,24 @@ if uploaded_file and st.button("Generate Minutes", type="primary"):
 
         with st.spinner("Identifying speakers..."):
             if use_real_diarization and hf_token:
-                try:
-                    speaker_segments = real_diarization(audio_path, hf_token)
-                    labeled_segments = attach_real_speakers(segments, speaker_segments)
-                except Exception as e:
-                    import traceback
+                if not has_memory_for_real_diarization():
                     st.warning(
-                        f"Real diarization failed ({e}); falling back to simple speaker-turn detection."
+                        "Real pyannote diarization needs at least 2 GB of RAM and is disabled "
+                        "on this host to prevent the app from crashing. Using simple speaker-turn detection."
                     )
-                    with st.expander("Show full error details"):
-                        st.code(traceback.format_exc())
                     labeled_segments = simple_speaker_split(segments, pause_threshold=pause_threshold)
+                else:
+                    try:
+                        speaker_segments = real_diarization(audio_path, hf_token.strip())
+                        labeled_segments = attach_real_speakers(segments, speaker_segments)
+                    except Exception as e:
+                        import traceback
+                        st.warning(
+                            f"Real diarization failed ({e}); falling back to simple speaker-turn detection."
+                        )
+                        with st.expander("Show full error details"):
+                            st.code(traceback.format_exc())
+                        labeled_segments = simple_speaker_split(segments, pause_threshold=pause_threshold)
             else:
                 labeled_segments = simple_speaker_split(segments, pause_threshold=pause_threshold)
 
