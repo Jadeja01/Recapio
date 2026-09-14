@@ -2,7 +2,7 @@
 streamlit
 torch
 openai-whisper
-transformers==4.44.2
+transformers
 sentencepiece
 python-docx
 spacy

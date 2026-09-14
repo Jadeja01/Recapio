@@ -110,8 +110,18 @@ def attach_real_speakers(segments, speaker_segments):
 
 
 def summarize_text(full_text):
-    from transformers import pipeline as hf_pipeline
-    summarizer = hf_pipeline("summarization", model="sshleifer/distilbart-cnn-6-6")
+    # Load the model/tokenizer directly instead of using the pipeline()
+    # task-name shorthand ("summarization"). Some transformers releases
+    # have changed or dropped that task-registry lookup, causing
+    # KeyError: Unknown task summarization even though the model itself
+    # works fine. Direct loading sidesteps that entirely.
+    import torch
+    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+
+    model_name = "sshleifer/distilbart-cnn-6-6"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+    model.eval()
 
     def chunk_text(text, max_words=500):
         words = text.split()
@@ -119,11 +129,23 @@ def summarize_text(full_text):
             yield " ".join(words[i:i + max_words])
 
     parts = []
-    for chunk in chunk_text(full_text):
-        out = summarizer(chunk, max_length=100, min_length=20, do_sample=False)
-        parts.append(out[0]["summary_text"])
+    with torch.no_grad():
+        for chunk in chunk_text(full_text):
+            inputs = tokenizer(
+                chunk, return_tensors="pt", truncation=True, max_length=1024
+            )
+            summary_ids = model.generate(
+                **inputs,
+                max_length=100,
+                min_length=20,
+                num_beams=4,
+                do_sample=False,
+            )
+            summary = tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+            parts.append(summary)
 
-    del summarizer
+    del model
+    del tokenizer
     gc.collect()
     return " ".join(parts)
 
