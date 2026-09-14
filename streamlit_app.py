@@ -43,6 +43,18 @@ ACTION_PATTERNS = [
     r"\bby (monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d{1,2}\s?(am|pm)?)\b",
 ]
 ACTION_REGEX = re.compile("|".join(ACTION_PATTERNS), re.IGNORECASE)
+DATE_REGEX = re.compile(
+    r"\b(?:"
+    r"(?:mon|tues|wednes|thurs|fri|satur|sun)day"
+    r"|(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+    r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+    r"\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s+\d{4})?"
+    r"|\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?"
+    r"|\b(?:today|tomorrow|next week|this week|next month)\b"
+    r")\b",
+    re.IGNORECASE,
+)
+OWNER_REGEX = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+(?:will|needs? to|should|must)\b")
 
 
 # --------------------------------------------------------------------
@@ -121,14 +133,11 @@ def summarize_text(full_text):
 
 
 def extract_action_items_and_dates(labeled_segments):
-    """Single spaCy pass that returns two things:
-    - action_items: lines matching ACTION_REGEX, with owner + due date
-    - key_dates: every DATE entity mentioned anywhere in the transcript,
-      with the speaker who said it and the sentence it appeared in
-      (used for the Agenda / Key Dates section)."""
-    import spacy
-    nlp = spacy.load("en_core_web_sm")
+    """Extract useful action and date signals without a large NLP model.
 
+    This deliberately uses conservative patterns so the app remains small
+    and deployable on Streamlit Cloud without downloading a spaCy model.
+    """
     action_items = []
     key_dates = []
 
@@ -136,12 +145,11 @@ def extract_action_items_and_dates(labeled_segments):
         text = seg["text"]
         if not text:
             continue
-        doc = nlp(text)
-        dates_in_seg = [e.text for e in doc.ents if e.label_ == "DATE"]
+        dates_in_seg = DATE_REGEX.findall(text)
 
         if ACTION_REGEX.search(text):
-            people = [e.text for e in doc.ents if e.label_ == "PERSON"]
-            owner = people[0] if people else seg["speaker"]
+            owner_match = OWNER_REGEX.search(text)
+            owner = owner_match.group(1) if owner_match else seg["speaker"]
             due = dates_in_seg[0] if dates_in_seg else "Not specified"
             action_items.append({"task": text, "owner": owner, "due": due})
 
@@ -152,8 +160,6 @@ def extract_action_items_and_dates(labeled_segments):
                 "context": text,
             })
 
-    del nlp
-    gc.collect()
     return action_items, key_dates
 
 
