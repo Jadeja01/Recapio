@@ -265,6 +265,11 @@ def build_docx(summary, action_items, key_dates, labeled_segments):
     return tmp_path
 
 
+def save_hf_token():
+    """Keep the token when the advanced option is temporarily turned off."""
+    st.session_state["saved_hf_token"] = st.session_state.get("hf_token_input", "")
+
+
 # --------------------------------------------------------------------
 # UI
 # --------------------------------------------------------------------
@@ -291,8 +296,13 @@ st.markdown(
         .step-number { color: #6645a5; font-weight: 800; font-size: 0.8rem; letter-spacing: 0.06em; }
         .step-title { color: #202944; font-weight: 700; margin: 0.25rem 0; }
         .step-copy { color: #667085; font-size: 0.9rem; line-height: 1.45; margin: 0; }
-        .stFileUploader { background: white; border: 1px solid #e1e5ee; border-radius: 14px; padding: 0.85rem 1rem; }
-        div[data-testid="stExpander"] { background: white; border: 1px solid #e6e9f1; border-radius: 12px; }
+        .stFileUploader { background: #ffffff; border: 1px solid #e1e5ee; border-radius: 14px; padding: 0.85rem 1rem; color: #18213d; }
+        .stFileUploader * { color: #18213d !important; }
+        .stFileUploader button { color: #18213d !important; border-color: #cbd2e1 !important; }
+        div[data-testid="stExpander"] { background: #ffffff; border: 1px solid #e6e9f1; border-radius: 12px; color: #18213d; }
+        div[data-testid="stExpander"] * { color: #18213d; }
+        div[data-testid="stExpander"] input { color: #18213d !important; background: #ffffff !important; }
+        div[data-testid="stExpander"] [data-testid="stCaptionContainer"] p { color: #5b6477 !important; }
         .stButton > button { border-radius: 9px; font-weight: 700; min-height: 2.7rem; }
     </style>
     <section class="hero">
@@ -328,8 +338,14 @@ hf_token = None
 pause_threshold = 1.2
 if use_real_diarization:
     hf_token = st.text_input(
-        "Hugging Face token (read access; needed for pyannote)", type="password"
+        "Hugging Face token (read access; needed for pyannote)",
+        value=st.session_state.get("saved_hf_token", ""),
+        type="password",
+        key="hf_token_input",
+        on_change=save_hf_token,
     )
+    # Save it on every rerun too, so a subsequent checkbox toggle keeps it.
+    st.session_state["saved_hf_token"] = hf_token
     st.caption(
         "Accept the model terms first at huggingface.co/pyannote/speaker-diarization-community-1, "
         "then generate a token at "
