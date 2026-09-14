@@ -1,29 +1,26 @@
 """
-Recapio - AI-Powered Meeting Minutes Generator (Streamlit version)
+AI-Powered Meeting Minutes Generator - Streamlit version
 Built to fit inside Streamlit Community Cloud's free tier (~1GB RAM).
 
-UI NOTES (read this if you're editing styling):
-- Almost all styling comes from .streamlit/config.toml (theme colors),
-  NOT from injected CSS. Streamlit computes correct contrast and hover
-  states for anything driven by the theme config, so this is far more
-  robust across Streamlit versions than hand-written <style> overrides.
-- The "how it works" cards use st.container(border=True), a native
-  Streamlit feature (1.32+) - no custom HTML/CSS needed for them.
-- Only a tiny, minimal CSS snippet remains (the hero banner gradient),
-  and every element inside it has an explicit color set so it can't
-  end up invisible against a light OR dark browser/OS theme.
+Key differences from the Gradio/HF-Spaces version:
+- Uses Whisper "tiny" (much smaller than "base") for transcription.
+- Uses a small distilled summarizer (sshleifer/distilbart-cnn-6-6) instead
+  of full BART.
+- Models are loaded ONE AT A TIME and explicitly deleted + garbage
+  collected right after use, so peak memory never has more than one
+  model resident at once. This trades speed for memory headroom.
+- Real speaker diarization (pyannote) is OPTIONAL and opt-in via a
+  checkbox, since it's the heaviest component. By default, a simple
+  pause-based heuristic is used instead (see simple_speaker_split).
+  This is NOT true diarization - it just alternates a label whenever
+  there's a long pause between segments. It cannot recognize that a
+  speaker who left and returned is the same person.
 
-TOKEN PERSISTENCE:
-- The Hugging Face token is stored in the *visitor's own browser*
-  localStorage (via the streamlit-local-storage package), never on the
-  server and never shared between visitors. Check "Remember on this
-  device" once, and it's pre-filled on every future visit from that
-  browser. Unchecking it (or clearing browser storage) forgets it.
-- If the streamlit-local-storage package isn't available for any
-  reason, the app falls back to plain st.session_state, which still
-  works but only lasts for the current tab/session (not across
-  reloads) - this keeps the app from crashing if that dependency is
-  ever missing.
+Deploy on https://share.streamlit.io for free:
+  1. Push this file (as streamlit_app.py), requirements.txt and
+     packages.txt to a public GitHub repo.
+  2. Go to share.streamlit.io -> New app -> pick the repo/branch.
+  3. Set "Main file path" to streamlit_app.py -> Deploy.
 """
 
 import os
@@ -36,16 +33,10 @@ from collections import defaultdict
 import streamlit as st
 from docx import Document
 
-try:
-    from streamlit_local_storage import LocalStorage
-    _local_storage = LocalStorage()
-except Exception:
-    _local_storage = None
-
 st.set_page_config(
-    page_title="Recapio | Meeting minutes, ready to share",
+    page_title="Recepio | Meeting minutes, ready to share",
     page_icon="🎙️",
-    layout="centered",
+    layout="wide",
 )
 
 ACTION_PATTERNS = [
@@ -71,11 +62,9 @@ def transcribe_audio(audio_path):
 
 
 def simple_speaker_split(segments, pause_threshold=1.2):
-    """Lightweight, no-model speaker-turn heuristic. Flips the speaker
-    label whenever the pause between segments exceeds pause_threshold
-    seconds. This is NOT true diarization - it cannot recognize that a
-    speaker who left and returned is the same person - but it costs no
-    extra memory or dependency, so it's the default path."""
+    """Lightweight, no-model speaker-turn heuristic (see module docstring).
+    pause_threshold: seconds of silence between segments before flipping
+    the speaker label. Lower = more sensitive to short pauses."""
     labeled = []
     current_speaker = 1
     prev_end = None
@@ -94,9 +83,13 @@ def simple_speaker_split(segments, pause_threshold=1.2):
 
 def has_memory_for_real_diarization(minimum_gib=2):
     """Avoid a process-level OOM kill on memory-limited Linux hosts.
-    An OOM kill can't be caught in Python, so check the cgroup limit
-    before loading pyannote's model. Unknown limits are treated as
-    sufficient, so local/larger deployments are unaffected."""
+
+    Pyannote's neural diarization model does not fit alongside a running
+    Streamlit process in the 1 GB Community Cloud container.  An OOM kill
+    cannot be caught in Python, so check the cgroup limit before loading it.
+    Unknown limits are treated as sufficient, which keeps local deployments
+    and larger hosts fully functional.
+    """
     cgroup_limit = "/sys/fs/cgroup/memory.max"
     try:
         with open(cgroup_limit, "r", encoding="utf-8") as limit_file:
@@ -109,13 +102,19 @@ def has_memory_for_real_diarization(minimum_gib=2):
 
 
 def real_diarization(audio_path, hf_token):
-    """True diarization using pyannote's current pipeline."""
+    """True diarization using pyannote's current TorchCodec-compatible model."""
     from pyannote.audio import Pipeline
 
+    # ``community-1`` is the maintained pyannote pipeline for pyannote.audio
+    # 4.x. The legacy ``speaker-diarization-3.1`` pipeline is only compatible
+    # with pyannote.audio 3.x and breaks with current Streamlit Cloud wheels.
     pipeline = Pipeline.from_pretrained(
         "pyannote/speaker-diarization-community-1", token=hf_token
     )
     output = pipeline(audio_path)
+
+    # The exclusive annotation prevents overlapping labels and maps more
+    # cleanly to Whisper's timestamped transcript segments.
     diarization = output.exclusive_speaker_diarization
     speaker_segments = [
         {"start": turn.start, "end": turn.end, "speaker": speaker}
@@ -149,6 +148,11 @@ def attach_real_speakers(segments, speaker_segments):
 
 
 def summarize_text(full_text):
+    # Load the model/tokenizer directly instead of using the pipeline()
+    # task-name shorthand ("summarization"). Some transformers releases
+    # have changed or dropped that task-registry lookup, causing
+    # KeyError: Unknown task summarization even though the model itself
+    # works fine. Direct loading sidesteps that entirely.
     import torch
     from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
@@ -165,22 +169,37 @@ def summarize_text(full_text):
     parts = []
     with torch.no_grad():
         for chunk in chunk_text(full_text):
-            inputs = tokenizer(chunk, return_tensors="pt", truncation=True, max_length=1024)
-            summary_ids = model.generate(
-                **inputs, max_length=100, min_length=20, num_beams=4, do_sample=False,
+            inputs = tokenizer(
+                chunk, return_tensors="pt", truncation=True, max_length=1024
             )
-            parts.append(tokenizer.decode(summary_ids[0], skip_special_tokens=True))
+            summary_ids = model.generate(
+                **inputs,
+                max_length=100,
+                min_length=20,
+                num_beams=4,
+                do_sample=False,
+            )
+            summary = tokenizer.decode(summary_ids[0], skip_special_tokens=True)
+            parts.append(summary)
 
-    del model, tokenizer
+    del model
+    del tokenizer
     gc.collect()
     return " ".join(parts)
 
 
 def extract_action_items_and_dates(labeled_segments):
+    """Single spaCy pass that returns two things:
+    - action_items: lines matching ACTION_REGEX, with owner + due date
+    - key_dates: every DATE entity mentioned anywhere in the transcript,
+      with the speaker who said it and the sentence it appeared in
+      (used for the Agenda / Key Dates section)."""
     import spacy
     nlp = spacy.load("en_core_web_sm")
 
-    action_items, key_dates = [], []
+    action_items = []
+    key_dates = []
+
     for seg in labeled_segments:
         text = seg["text"]
         if not text:
@@ -195,7 +214,11 @@ def extract_action_items_and_dates(labeled_segments):
             action_items.append({"task": text, "owner": owner, "due": due})
 
         for d in dates_in_seg:
-            key_dates.append({"date": d, "speaker": seg["speaker"], "context": text})
+            key_dates.append({
+                "date": d,
+                "speaker": seg["speaker"],
+                "context": text,
+            })
 
     del nlp
     gc.collect()
@@ -242,72 +265,58 @@ def build_docx(summary, action_items, key_dates, labeled_segments):
     return tmp_path
 
 
-# --------------------------------------------------------------------
-# Token persistence helpers (browser localStorage, per-visitor)
-# --------------------------------------------------------------------
-
-def load_saved_token():
-    if _local_storage is not None:
-        try:
-            return _local_storage.getItem("recapio_hf_token") or ""
-        except Exception:
-            return st.session_state.get("hf_token", "")
-    return st.session_state.get("hf_token", "")
-
-
-def save_token(token, remember):
-    st.session_state["hf_token"] = token
-    if _local_storage is not None:
-        try:
-            if remember and token:
-                _local_storage.setItem("recapio_hf_token", token)
-            elif not remember:
-                _local_storage.deleteItem("recapio_hf_token")
-        except Exception:
-            pass
+def save_hf_token():
+    """Keep the token when the advanced option is temporarily turned off."""
+    st.session_state["saved_hf_token"] = st.session_state.get("hf_token_input", "")
 
 
 # --------------------------------------------------------------------
-# UI - minimal hero, then native Streamlit components for everything
-# else so contrast/hover states are handled by the theme, not by us.
+# UI
 # --------------------------------------------------------------------
 st.markdown(
     """
-    <div style="
-        background: linear-gradient(120deg, #15235d 0%, #3d2d83 58%, #7450ac 100%);
-        border-radius: 18px; padding: 2rem 2rem; margin-bottom: 1.5rem;">
-        <div style="color:#d9ccff; font-size:0.8rem; font-weight:700;
-                    letter-spacing:0.08em; text-transform:uppercase;">
-            Recapio · Meeting intelligence
-        </div>
-        <div style="color:#ffffff; font-size:2rem; font-weight:700;
-                    line-height:1.15; margin-top:0.4rem;">
-            Turn conversations into clear next steps.
-        </div>
-        <div style="color:#eeeaff; font-size:1rem; margin-top:0.6rem; max-width:560px;">
-            Upload a recording and get a summary, action items, key dates,
-            and a downloadable minutes document - no account required.
-        </div>
-    </div>
+    <style>
+        .stApp { background: #f7f8fc; }
+        .block-container { max-width: 1120px; padding-top: 2.5rem; padding-bottom: 3rem; }
+        .hero {
+            background: linear-gradient(120deg, #15235d 0%, #3d2d83 58%, #7450ac 100%);
+            border-radius: 22px;
+            color: white;
+            padding: 2.5rem 2.75rem;
+            margin-bottom: 1.6rem;
+            box-shadow: 0 18px 40px rgba(37, 30, 91, 0.18);
+        }
+        .eyebrow { color: #d9ccff; font-size: 0.82rem; font-weight: 700; letter-spacing: 0.09em; text-transform: uppercase; margin-bottom: 0.65rem; }
+        .hero h1 { color: white; font-size: 2.45rem; line-height: 1.12; margin: 0 0 0.7rem; }
+        .hero p { color: #eeeaff; font-size: 1.05rem; line-height: 1.6; margin: 0; max-width: 650px; }
+        .section-kicker { color: #6b7280; font-size: 0.82rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; margin: 0.5rem 0 0.3rem; }
+        .section-title { color: #18213d; font-size: 1.45rem; font-weight: 700; margin: 0 0 0.25rem; }
+        .section-copy { color: #5b6477; margin: 0 0 1rem; }
+        .step { background: white; border: 1px solid #e6e9f1; border-radius: 14px; padding: 1rem 1.1rem; min-height: 122px; }
+        .step-number { color: #6645a5; font-weight: 800; font-size: 0.8rem; letter-spacing: 0.06em; }
+        .step-title { color: #202944; font-weight: 700; margin: 0.25rem 0; }
+        .step-copy { color: #667085; font-size: 0.9rem; line-height: 1.45; margin: 0; }
+        .stFileUploader { background: #ffffff; border: 1px solid #e1e5ee; border-radius: 14px; padding: 0.85rem 1rem; color: #18213d; }
+        .stFileUploader * { color: #18213d !important; }
+        .stFileUploader button { color: #18213d !important; border-color: #cbd2e1 !important; }
+        div[data-testid="stExpander"] { background: #ffffff; border: 1px solid #e6e9f1; border-radius: 12px; color: #18213d; }
+        div[data-testid="stExpander"] * { color: #18213d; }
+        div[data-testid="stExpander"] input { color: #18213d !important; background: #ffffff !important; }
+        div[data-testid="stExpander"] [data-testid="stCaptionContainer"] p { color: #5b6477 !important; }
+        .stButton > button { border-radius: 9px; font-weight: 700; min-height: 2.7rem; }
+    </style>
+    <section class="hero">
+        <div class="eyebrow">Recepio · Meeting intelligence</div>
+        <h1>Turn conversations into<br>clear next steps.</h1>
+        <p>Upload your meeting recording and get a share-ready summary, action items, key dates, and a downloadable minutes document.</p>
+    </section>
     """,
     unsafe_allow_html=True,
 )
 
-cols = st.columns(3)
-steps = [
-    ("1", "Upload", "Add your meeting recording (MP3, WAV, or M4A)."),
-    ("2", "Review", "Recapio transcribes, summarizes, and finds commitments."),
-    ("3", "Share", "Download polished, ready-to-send meeting minutes."),
-]
-for col, (number, title, copy) in zip(cols, steps):
-    with col:
-        with st.container(border=True):
-            st.caption(f"STEP {number}")
-            st.markdown(f"**{title}**")
-            st.caption(copy)
-
-st.divider()
-st.subheader("Start with your recording")
+st.markdown('<div class="section-kicker">Create minutes</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-title">Start with your recording</div>', unsafe_allow_html=True)
+st.markdown('<p class="section-copy">MP3, WAV, and M4A files are supported. Processing happens one stage at a time to keep the app lightweight.</p>', unsafe_allow_html=True)
 
 uploaded_file = st.file_uploader(
     "Meeting recording",
@@ -315,51 +324,65 @@ uploaded_file = st.file_uploader(
     help="Choose an audio recording of the meeting you want to turn into minutes.",
 )
 
-pause_threshold = 1.2
-use_real_diarization = False
-hf_token = ""
-
-with st.expander("Advanced: speaker recognition (optional)"):
-    st.caption(
-        "By default, Recapio uses simple pause-based speaker detection - "
-        "no account or setup needed. Turn this on only if you want more "
-        "accurate, voice-based speaker identification."
+with st.expander("Speaker detection settings", expanded=False):
+    st.caption("Use the default setting for the fastest, most reliable experience on free hosting.")
+    use_real_diarization = st.checkbox(
+        "Use advanced speaker recognition (requires a Hugging Face token and more memory)",
+        value=False,
     )
-    use_real_diarization = st.checkbox("Use advanced speaker recognition (Hugging Face)")
 
-    if use_real_diarization:
-        saved_token = load_saved_token()
-        remember = st.checkbox(
-            "Remember my token on this device",
-            value=bool(saved_token),
-            help="Stored only in your browser's local storage. Never sent to or saved on our server.",
-        )
-        hf_token = st.text_input(
-            "Hugging Face token (read access)",
-            value=saved_token,
-            type="password",
-        )
-        save_token(hf_token, remember)
-        st.caption(
-            "Need a token? Accept the model terms at "
-            "huggingface.co/pyannote/speaker-diarization-community-1, "
-            "then create one at huggingface.co/settings/tokens."
-        )
-    else:
-        pause_threshold = st.slider(
-            "Speaker-turn pause sensitivity (seconds)",
-            min_value=0.3, max_value=3.0, value=1.2, step=0.1,
-            help=(
-                "Flips the speaker label whenever the gap between segments "
-                "exceeds this value. Lower it for audio with short pauses "
-                "between speakers; raise it if one speaker's natural "
-                "pauses are wrongly splitting them into two."
-            ),
-        )
+if not use_real_diarization:
+    st.caption("Using simple speaker-turn detection. You can fine-tune it below if needed.")
 
-generate = st.button("Generate Minutes", type="primary", disabled=uploaded_file is None)
+hf_token = None
+pause_threshold = 1.2
+if use_real_diarization:
+    hf_token = st.text_input(
+        "Hugging Face token (read access; needed for pyannote)",
+        value=st.session_state.get("saved_hf_token", ""),
+        type="password",
+        key="hf_token_input",
+        on_change=save_hf_token,
+    )
+    # Save it on every rerun too, so a subsequent checkbox toggle keeps it.
+    st.session_state["saved_hf_token"] = hf_token
+    st.caption(
+        "Accept the model terms first at huggingface.co/pyannote/speaker-diarization-community-1, "
+        "then generate a token at "
+        "huggingface.co/settings/tokens."
+    )
+else:
+    pause_threshold = st.slider(
+        "Speaker-turn pause sensitivity (seconds)",
+        min_value=0.3, max_value=3.0, value=1.2, step=0.1,
+        help=(
+            "Simple speaker-turn detection flips the speaker label whenever "
+            "the gap between segments exceeds this value. Lower it if your "
+            "audio has short pauses between speakers; raise it if one "
+            "speaker's natural pauses are wrongly splitting them into two."
+        ),
+    )
 
-if generate and uploaded_file:
+st.markdown('<div class="section-kicker">How it works</div>', unsafe_allow_html=True)
+steps = st.columns(3)
+for column, number, title, copy in zip(
+    steps,
+    ("01", "02", "03"),
+    ("Upload", "Review", "Share"),
+    (
+        "Add your meeting recording in one of the supported formats.",
+        "Recepio transcribes, summarizes, and highlights commitments.",
+        "Review the results and download polished meeting minutes.",
+    ),
+):
+    column.markdown(
+        f'<div class="step"><div class="step-number">{number}</div><div class="step-title">{title}</div><p class="step-copy">{copy}</p></div>',
+        unsafe_allow_html=True,
+    )
+
+st.markdown("<br>", unsafe_allow_html=True)
+
+if uploaded_file and st.button("Generate Minutes", type="primary"):
     suffix = os.path.splitext(uploaded_file.name)[1]
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(uploaded_file.read())
@@ -373,8 +396,8 @@ if generate and uploaded_file:
             if use_real_diarization and hf_token:
                 if not has_memory_for_real_diarization():
                     st.warning(
-                        "Real speaker recognition needs at least 2GB of RAM and is disabled "
-                        "on this host to avoid crashing. Using simple speaker-turn detection instead."
+                        "Real pyannote diarization needs at least 2 GB of RAM and is disabled "
+                        "on this host to prevent the app from crashing. Using simple speaker-turn detection."
                     )
                     labeled_segments = simple_speaker_split(segments, pause_threshold=pause_threshold)
                 else:
@@ -383,7 +406,9 @@ if generate and uploaded_file:
                         labeled_segments = attach_real_speakers(segments, speaker_segments)
                     except Exception as e:
                         import traceback
-                        st.warning(f"Real diarization failed ({e}); falling back to simple speaker-turn detection.")
+                        st.warning(
+                            f"Real diarization failed ({e}); falling back to simple speaker-turn detection."
+                        )
                         with st.expander("Show full error details"):
                             st.code(traceback.format_exc())
                         labeled_segments = simple_speaker_split(segments, pause_threshold=pause_threshold)
@@ -403,7 +428,6 @@ if generate and uploaded_file:
             os.remove(audio_path)
         gc.collect()
 
-    st.divider()
     st.subheader("Transcript (with speaker turns)")
     st.text("\n".join(f"[{s['speaker']}] {s['text']}" for s in labeled_segments))
 
@@ -411,10 +435,20 @@ if generate and uploaded_file:
     st.write(summary)
 
     st.subheader("Key Dates Mentioned (Agenda)")
-    st.table(key_dates) if key_dates else st.caption("No specific dates detected in the discussion.")
+    if key_dates:
+        st.table(key_dates)
+    else:
+        st.write("No specific dates detected in the discussion.")
 
     st.subheader("Action Items")
-    st.table(action_items) if action_items else st.caption("No clear action items detected.")
+    if action_items:
+        st.table(action_items)
+    else:
+        st.write("No clear action items detected.")
 
     with open(docx_path, "rb") as f:
-        st.download_button("📄 Download Meeting Minutes (.docx)", f, file_name="Meeting_Minutes.docx")
+        st.download_button(
+            "📄 Download Meeting Minutes (.docx)",
+            f,
+            file_name="Meeting_Minutes.docx",
+        )
